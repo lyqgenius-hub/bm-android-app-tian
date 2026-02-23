@@ -55,9 +55,6 @@ import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -68,9 +65,8 @@ import java.util.Date
 import java.util.Locale
 import androidx.compose.runtime.collectAsState
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.withContext
+import java.util.Locale.getDefault
 
 // 自定义Dialog类，实现所有三个必需的接口
 class FloatWindowDialog(context: Context) : Dialog(context), LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
@@ -135,13 +131,14 @@ class FloatWindowService : AccessibilityService(), LifecycleOwner {
     private val _logMessages = MutableStateFlow<List<String>>(emptyList())
     val logMessages: StateFlow<List<String>> = _logMessages.asStateFlow()
     private var isAutomationRunning by mutableStateOf(false)
-    private var automationJob: Job? = null
     private var isMaximized by mutableStateOf(true) // 悬浮窗默认最大化
     private var lastClickTime = 0L
     private val CLICK_INTERVAL = 500L // 500ms内禁止重复点击
     private var isHandling = false    // 标记是否正在处理点击请求
 //    在开始自动化任务时获取 CPU 唤醒锁，保证 CPU 不休眠；任务结束或用户点击停止时释放
     private var wakeLock: PowerManager.WakeLock? = null
+
+    private lateinit var automationEngine: AutomationEngine
 
     companion object {
         private const val CHANNEL_ID = "float_window_channel"
@@ -178,8 +175,18 @@ class FloatWindowService : AccessibilityService(), LifecycleOwner {
         super.onServiceConnected()
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        automationEngine = AutomationEngine(this, lifecycleScope)
+
+        // 监听自动化引擎状态变化
+        lifecycleScope.launch {
+            automationEngine.context.collect { context ->
+                if (!context.isRunning) {
+                    stopAutomation()
+                }
+            }
+        }
         showFloatWindow()
-        addLog("✅ 无障碍服务已连接并获取特权")
+        logInfo("无障碍服务已连接并获取特权")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -657,46 +664,41 @@ class FloatWindowService : AccessibilityService(), LifecycleOwner {
     private fun startAutomation() {
         // 防抖+状态校验，防止重复启动
         if (!canClick() || isAutomationRunning) return
+        logInfo("自动化任务启动")
         isHandling = true
-
         isAutomationRunning = true
-        addLog("自动化任务启动")
         isMaximized = true
         switchToDot()
         acquireWakeLock()
         isHandling = false
-        automationJob = CoroutineScope(Dispatchers.IO).launch {
-            try {
-                // 模拟自动化操作
-                repeat(10) {
-                    addLog("执行自动化操作 ${it + 1}")
-                    delay(1000)
-                }
-            } catch (e: CancellationException) {
-                addLog("✅ 任务正常取消")
-            } catch (e: Exception) {
-                addLog("❌ 任务异常崩溃: ${e.message}")
-            } finally {
-                withContext(NonCancellable +Dispatchers.Main) {
-                    isAutomationRunning = false
-                    isHandling = false
-                    switchToPanel()
-                    releaseWakeLock()
-                    addLog("自动化任务完成")
-                }
-            }
+        try {
+            automationEngine.start()
+        } catch (e: CancellationException) {
+            logWarn("任务正常取消")
+        } catch (e: Exception) {
+            logError("任务启动异常: ${e.message}")
+        } finally {
+            isAutomationRunning = false
+            isHandling = false
+            switchToPanel()
+            releaseWakeLock()
+            logInfo("自动化任务完成")
         }
+
     }
 
     private fun stopAutomation() {
         // 新增：防抖+状态校验，防止重复停止（加这2行）
         if (!canClick() || !isAutomationRunning) return
         isHandling = true
-
-        automationJob?.cancel()
-        automationJob = null
+        try {
+            automationEngine.stop()
+        } catch (e: CancellationException) {
+            logWarn("任务正常取消")
+        } catch (e: Exception) {
+            logError("任务停止异常: ${e.message}")
+        }
         isAutomationRunning = false
-        addLog("自动化任务停止")
         isMaximized = true
         releaseWakeLock()
         lifecycleScope.launch {
@@ -704,9 +706,18 @@ class FloatWindowService : AccessibilityService(), LifecycleOwner {
             switchToPanel()
             isHandling = false
         }
+        logInfo("自动化任务停止")
     }
 
-    private fun addLogSafe(message: String) {
+    private fun addLogSafe(message: String, level: String = "debug") {
+        val prefix = when (level.lowercase(getDefault())) {
+            "info" -> "✅ "
+            "error" -> "❌ "
+            "warn" -> "⚠️ "  // 告警图标使用⚠️
+            "debug" -> ""    // debug默认无图标
+            else -> ""
+        }
+        val logMessage = "$prefix$message"
         val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         val newLog = "[$time] $message"
         // .update 是线程安全的，它会自动获取当前列表并生成新列表
@@ -723,6 +734,19 @@ class FloatWindowService : AccessibilityService(), LifecycleOwner {
     fun addLog(message: String) {
         addLogSafe(message)
     }
+
+    fun logError(message: String) {
+        addLogSafe(message, "error")
+    }
+
+    fun logWarn(message: String) {
+        addLogSafe(message, "warn")
+    }
+
+    fun logInfo(message: String) {
+        addLogSafe(message, "info")
+    }
+
 
     private fun clearLog() {
         clearLogSafe()
@@ -936,7 +960,9 @@ fun FloatWindowContent(
         }
         // 底部按钮区 - 全部使用图标按钮，排列成一行
         Row(
-            modifier = Modifier.fillMaxWidth().padding(4.dp), // 减少内边距
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp), // 减少内边距
             horizontalArrangement = Arrangement.SpaceEvenly, // 均匀分布
             verticalAlignment = Alignment.CenterVertically
         ) {

@@ -14,7 +14,7 @@ class AutomationEngine(
     private val _context = MutableStateFlow(MobileContext())
     val context = _context.asStateFlow()
 
-    private var engineJob: Job? = null
+    var engineJob: Job? = null
 
     // 步骤配置表 - 实际开发中可以从本地 JSON 或服务器获取
     private val stepConfig = mutableMapOf<Int, Step>()
@@ -37,10 +37,8 @@ class AutomationEngine(
      */
     fun start() {
         if (_context.value.isRunning) return
-
         _context.update { it.copy(isRunning = true, step = 1) }
-        service.addLog("🚀 自动化引擎启动")
-
+        service.addLog("自动化引擎启动")
         engineJob = scope.launch(Dispatchers.IO) {
             try {
                 var currentId = _context.value.step
